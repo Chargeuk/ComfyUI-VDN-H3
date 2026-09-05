@@ -21,6 +21,14 @@ import torch.nn.functional as F
 
 _log = logging.getLogger("comfy.vdn")
 
+# Preserve new_tensor(1e-6).item() rounding without a device allocation/readback.
+_NORM_EPSILON = {
+    torch.bfloat16: 9.98377799987793e-7,
+    torch.float16: 1.0132789611816406e-6,
+    torch.float32: 9.999999974752427e-7,
+    torch.float64: 1e-6,
+}
+
 
 # ---------------------------------------------------------------- delta rules --
 
@@ -135,16 +143,26 @@ def _tf32_matmul():
     return _Ctx()
 
 
-def frame_statistics(kf, vf, beta, a_fp32=True):
+def _frame_stats_prep(kf, vf, beta):
+    kf16 = kf.contiguous()
+    kf32 = kf16.float()
+    scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
+    vb = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
+    return kf16, kf32, scaled32, vb
+
+
+def frame_statistics(kf, vf, beta, a_fp32=True, fuse=False):
     """A[f,h,k,l] = sum_s k beta k,  B[f,h,v,k] = sum_s v beta k, over one chunk's
     rows. A in fp32 (bf16's 8 mantissa bits break the conditioning I+A needs), B left
     in bf16 for the tensor-core GEMM and promoted on the store. Operates with autocast
     off implicitly -- callers run under inference no_grad, no ambient autocast."""
     with torch.autocast(device_type=kf.device.type, enabled=False):
-        kf16 = kf.contiguous()
-        kf32 = kf16.float()
-        scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
-        vb = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
+        if fuse:
+            key = ("stats_prep", str(kf.device), kf.dtype, vf.dtype, beta.dtype)
+            kf16, kf32, scaled32, vb = _run_compiled(
+                key, _frame_stats_prep, kf, vf, beta)
+        else:
+            kf16, kf32, scaled32, vb = _frame_stats_prep(kf, vf, beta)
         if a_fp32:
             prev = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -174,13 +192,15 @@ def _run_compiled(key, body, *args, _mode=None, **kwargs):
         return body(*args, **kwargs)
     try:
         if key not in _COMPILED_CACHE:
+            _log.info("[vdn] compiling %s (first use may take time)", key)
             _COMPILED_CACHE[key] = torch.compile(body, dynamic=False, mode=_mode)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return _COMPILED_CACHE[key](*args, **kwargs)
     except Exception as e:
         _COMPILED_BROKEN.add(key)
-        _log.debug("[vdn] compile of %s failed (%s); using eager", key, e)
+        _COMPILED_CACHE.pop(key, None)
+        _log.warning("[vdn] compile of %s failed (%s); using eager", key, e)
         return body(*args, **kwargs)
 
 
@@ -484,6 +504,8 @@ class LinearBranch:
         self.enable_text_state = enable_text_state
         self.delta_rule = delta_rule
         self.fuse_epilogue = False
+        self.compile_scan = False
+        self.fuse_statistics = False
         self.retain_buffers = retain_buffers
         self._backend = None
         self._backend_key = None
@@ -532,7 +554,8 @@ class LinearBranch:
         value = value.view(1, length, n_heads, head_dim).permute(0, 2, 1, 3)
         beta = torch.sigmoid(F.linear(text_x, w["beta_proj.weight"]))
         beta = beta.view(1, length, n_heads).permute(0, 2, 1)
-        a, b = frame_statistics(key, value, beta, a_fp32=self.a_fp32)
+        a, b = frame_statistics(key, value, beta, a_fp32=self.a_fp32,
+                                fuse=self.fuse_statistics)
         backend = self._delta_backend(length)
         with torch.autocast(device_type=a.device.type, enabled=False):
             ones = torch.ones(1, n_heads, head_dim, device=a.device, dtype=a.dtype)
@@ -587,7 +610,8 @@ class LinearBranch:
         beta = torch.sigmoid(F.linear(xv, w["beta_proj.weight"]))
         beta = beta.view(num_frames, tokens_per_frame, n_heads).permute(0, 2, 1)
 
-        a, b = frame_statistics(key_by_frame, value_by_frame, beta, a_fp32=self.a_fp32)
+        a, b = frame_statistics(key_by_frame, value_by_frame, beta,
+                                a_fp32=self.a_fp32, fuse=self.fuse_statistics)
 
         # fp32 on the mean, not just inside alpha: bf16 rounding before the fp32 island
         # would throw away what alpha's fp32 math cannot recover
@@ -599,7 +623,7 @@ class LinearBranch:
         text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
         prefix_states, suffix_states = run_scans(backend, alpha, a, b,
                                                  text_state=text_state,
-                                                 fuse=self.fuse_epilogue,
+                                                 fuse=self.fuse_epilogue or self.compile_scan,
                                                  retain=self.retain_buffers)
         gate = torch.sigmoid(F.linear(xv, w["output_gate.down.weight"])
                              @ w["output_gate.up.weight"].T
@@ -618,5 +642,5 @@ class LinearBranch:
             query_fhsd = query.view(shape).permute(0, 2, 1, 3)
         readout = torch.matmul(query_fhsd, linear_state.transpose(-1, -2))
         return linear_epilogue(readout, w["norm.weight"], gate,
-                               w["norm.weight"].new_tensor(1e-6).item(),
+                               _NORM_EPSILON[w["norm.weight"].dtype],
                                fuse=self.fuse_epilogue)

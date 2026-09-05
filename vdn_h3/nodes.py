@@ -17,6 +17,26 @@ import vdn_h3.spec as spec
 _log = logging.getLogger("comfy.vdn")
 
 
+def _performance_inputs():
+    return {
+        "prefetch": (["auto", "off", "on"], {
+            "default": "auto",
+            "tooltip": "Prefetch one branch block independently of retained buffers. "
+                       "Both auto and on require workspace/base-model headroom. "
+                       "Unused when branch weights are GPU-resident."}),
+        "compile_scan": ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Compile only the recurrence scans. Leaves the epilogue, "
+                       "gather and activations unchanged. First use compiles and "
+                       "may reserve graph memory; falls back to eager on failure."}),
+        "fuse_statistics": ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Fuse only frame-statistics preparation (layout, casts and "
+                       "scaling). Keeps GEMMs and solver precision unchanged. "
+                       "Experimental: validate on your GPU before enabling."}),
+    }
+
+
 _COMPILER_DISABLED_BY_VDN = False
 _COMPILER_WARNED = False
 
@@ -62,17 +82,20 @@ def _disable_comfy_compiler_on_broken_builds():
 
 def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                attention_backend, verbose, apply_turbo_adapter=True,
-               cfg_overrides=None, fast_kernels=False, retain_buffers="auto"):
+               cfg_overrides=None, fast_kernels=False, retain_buffers="auto",
+               prefetch="auto", compile_scan=False, fuse_statistics=False):
     """Shared core of ApplyVDNH3 and ApplyVDNH3Advanced. `strength` is a float or a
     {adapter_name: float} map; `cfg_overrides` deviates from the checkpoint's trained
     spec (ablation knobs); `fast_kernels` torch.compiles the branch's hot spots
     (epilogue, state gather, frame-major q store, bidirectional scan)."""
     _disable_comfy_compiler_on_broken_builds()
+    cache_mode = branch_weights
     path = spec.resolve_vdn_checkpoint(vdn_checkpoint)
     prefer_int8 = False
     retain = True
     if branch_weights == "auto" or retain_buffers == "auto":
-        # free VRAM right now = after the base model's load in the same run
+        # Select the checkpoint representation now; final residency is decided
+        # in the diffusion wrapper after ComfyUI has placed the base model.
         free = comfy.model_management.get_free_memory(
             comfy.model_management.get_torch_device())
     else:
@@ -146,6 +169,8 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                 for w in branch_weights_by_block]
     for b in branches:
         b.fuse_epilogue = fast_kernels
+        b.compile_scan = compile_scan
+        b.fuse_statistics = fuse_statistics
     if fast_kernels and "dmd" in os.path.basename(path).lower():
         _log.warning(
             "[vdn] fast_kernels on an 8-step DMD stage (%s): the compiled branch "
@@ -156,9 +181,25 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     state.owns_compiler_switch = _disable_comfy_compiler_on_broken_builds()
     state.retain_buffers = retain
     state.cache_gpu = branch_weights == "cache_gpu"
+    state.cache_mode = cache_mode
+    state.prefetch_mode = prefetch
+    state.stage_bytes = os.path.getsize(spec._branch_file(path, prefer_int8))
+    state.block_bytes = max(
+        sum(t.shape.numel() * t.dtype.itemsize for t in weights.values())
+        for weights in branch_weights_by_block) * 1.25
+    # Budget several base blocks for ComfyUI's concurrent offload streams.
+    state.base_stream_bytes = 4 * model.model_size() / len(branches)
+    state.verbose = verbose
     state.softmax_backend = attention_backend
 
     new_model = model.clone()
+    state.unloaded_bytes = lambda: max(0, new_model.model_size() - new_model.loaded_size())
+    if verbose:
+        _log.info("[vdn] options: cache=%s prefetch=%s retain=%s scan=%s "
+                  "statistics=%s fast_kernels=%s attention=%s; "
+                  "placement rechecked at each model forward",
+                  cache_mode, prefetch, retain_buffers, compile_scan,
+                  fuse_statistics, fast_kernels, attention_backend)
     apply_vdn(new_model, state)
 
     wanted = {"default"}
@@ -218,18 +259,18 @@ class ApplyVDNH3:
                            "rounding noise is amplified by the deep blocks and "
                            "visibly degrades output."}),            "branch_weights": (["auto", "stream", "cache_gpu"], {
                 "default": "auto",
-                "tooltip": "auto (default): cache_gpu when the free VRAM after the "
-                           "base load exceeds 1.5x the stage size + 4 GiB headroom, "
+                "tooltip": "auto: recheck GPU caching at each model forward, "
+                           "reserving workload and offloaded-base headroom; "
                            "else stream (prefers the int8_convrot stage file under "
                            "memory pressure). stream: the ~4.3 GB of linear-branch "
                            "weights are moved to the GPU per block per step, with a "
-                           "one-block lookahead prefetch (safe on small cards). "
+                           "separately budgeted one-block lookahead prefetch. "
                            "cache_gpu: resident on the GPU after the first step "
                            "(faster; keep ~4.3 GB VRAM free)."}),
             "retain_buffers": (["auto", "on", "off"], {
                 "default": "auto",
                 "tooltip": "Retained branch scratch/banks (scan banks, delta "
-                           "solve, window gather, q/k/v copies + prefetch) trade "
+                           "solve, window gather, q/k/v copies) trade "
                            "~0.5-1 GiB VRAM for churn-free steps. auto: retain "
                            "when free VRAM >= stage + 10 GiB headroom, else "
                            "transient (v1.3.1 allocation pattern, peak VRAM "
@@ -243,7 +284,7 @@ class ApplyVDNH3:
                            "pattern as one compiled FlexAttention kernel over the "
                            "full sequence (faster on long clips; first run compiles, "
                            "falls back to grouped if compile fails)."}),
-        }}
+        }, "optional": _performance_inputs()}
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
@@ -255,11 +296,13 @@ class ApplyVDNH3:
         "OpenVDN/vdn-minimax-h3) and a MiniMax-H3 base model.")
 
     def apply(self, model, vdn_checkpoint, apply_turbo_adapter, strength, lora_mode,
-              branch_weights, attention_backend, verbose, retain_buffers="auto"):
+              branch_weights, attention_backend, verbose, retain_buffers="auto",
+              prefetch="auto", compile_scan=False, fuse_statistics=False):
         return _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                           attention_backend, verbose,
                           apply_turbo_adapter=apply_turbo_adapter,
-                          retain_buffers=retain_buffers)
+                          retain_buffers=retain_buffers, prefetch=prefetch,
+                          compile_scan=compile_scan, fuse_statistics=fuse_statistics)
 
 
 class ApplyVDNH3Advanced:
@@ -294,18 +337,18 @@ class ApplyVDNH3Advanced:
                            "base node's tooltip."}),
             "branch_weights": (["auto", "stream", "cache_gpu"], {
                 "default": "auto",
-                "tooltip": "auto (default): cache_gpu when the free VRAM after the "
-                           "base load exceeds 1.5x the stage size + 4 GiB headroom, "
+                "tooltip": "auto: recheck GPU caching at each model forward, "
+                           "reserving workload and offloaded-base headroom; "
                            "else stream (prefers the int8_convrot stage file under "
                            "memory pressure). stream: branch weights move to the "
                            "GPU per block per step with a one-block lookahead "
-                           "prefetch (safe on small cards). cache_gpu: resident on "
+                           "prefetch when budget permits. cache_gpu: resident on "
                            "the GPU after the first step (faster; keep ~4.3 GB "
                            "VRAM free)."}),
             "retain_buffers": (["auto", "on", "off"], {
                 "default": "auto",
                 "tooltip": "Retained branch scratch/banks (scan banks, delta "
-                           "solve, window gather, q/k/v copies + prefetch) trade "
+                           "solve, window gather, q/k/v copies) trade "
                            "~0.5-1 GiB VRAM for churn-free steps. auto: retain "
                            "when free VRAM >= stage + 10 GiB headroom, else "
                            "transient (v1.3.1 allocation pattern, peak VRAM "
@@ -348,6 +391,7 @@ class ApplyVDNH3Advanced:
                            "compiles. Known to drift on 8-step DMD stages "
                            "(stage-dmd-*) on torch 2.10 -- ablation use only, "
                            "keep off for final renders (a warning is logged)."}),
+            **_performance_inputs(),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -362,7 +406,8 @@ class ApplyVDNH3Advanced:
               turbo_strength, lora_mode, branch_weights, attention_backend, verbose,
               retain_buffers="auto",
               window_radius=1, window_chunk=5, anchor_frames="both", text_state=True,
-              linear_branch=True, fast_kernels=False):
+              linear_branch=True, fast_kernels=False, prefetch="auto",
+              compile_scan=False, fuse_statistics=False):
         strength = {"default": stage_b_strength, "turbo": turbo_strength}
         cfg_overrides = {"radius": window_radius, "chunk": window_chunk,
                          "anchor_frames": anchor_frames,
@@ -372,7 +417,8 @@ class ApplyVDNH3Advanced:
                           attention_backend, verbose,
                           apply_turbo_adapter=apply_turbo_adapter,
                           cfg_overrides=cfg_overrides, fast_kernels=fast_kernels,
-                          retain_buffers=retain_buffers)
+                          retain_buffers=retain_buffers, prefetch=prefetch,
+                          compile_scan=compile_scan, fuse_statistics=fuse_statistics)
 
 
 NODE_CLASS_MAPPINGS = {"ApplyVDNH3": ApplyVDNH3,

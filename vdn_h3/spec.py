@@ -72,10 +72,10 @@ def auto_branch_policy(path, free_bytes):
         mode = "cache_gpu" if fits(size_quant) else "stream"
     else:
         mode = "stream"
-    chosen = quant if prefer_int8 else plain
+    chosen = _branch_file(path, prefer_int8)
     _log.info("[vdn] branch_weights=auto: %s, %s (%.1f GiB VRAM free, stage "
               "%.2f GiB%s)", os.path.basename(chosen), mode, free_bytes / gib,
-              (size_quant if prefer_int8 else size_plain) / gib,
+              os.path.getsize(chosen) / gib,
               ", int8 preferred under memory pressure"
               if prefer_int8 and have_plain else "")
     return mode, prefer_int8
@@ -96,6 +96,28 @@ def auto_retain_policy(path, prefer_int8, free_bytes):
               "retained" if retain else "transient", free_bytes / gib,
               stage / gib)
     return retain
+
+
+def runtime_memory_policy(free_bytes, stage_bytes, block_bytes, working_bytes,
+                          unloaded_bytes, cache_mode="auto", prefetch_mode="auto",
+                          base_stream_bytes=None):
+    """Budget placement after base loading. All sizes are host-side estimates.
+
+    Reserve working memory and the base's nonresident weights before spending
+    memory on VDN caching. Streaming reserves the base's transfer working set
+    instead of its entire offloaded model. A prefetch needs one extra block; double its
+    estimated size for transfer/allocator overhead. Explicit cache_gpu still
+    means cache_gpu, while prefetch=on remains constrained by the safety budget.
+    """
+    available = max(0, free_bytes - working_bytes - unloaded_bytes)
+    cache = cache_mode == "cache_gpu" or (
+        cache_mode == "auto" and available >= stage_bytes * 1.5)
+    stream_reserve = unloaded_bytes if base_stream_bytes is None else min(
+        unloaded_bytes, base_stream_bytes)
+    stream_available = max(0, free_bytes - working_bytes - stream_reserve)
+    prefetch = (not cache and prefetch_mode != "off"
+                and stream_available >= 2 * block_bytes)
+    return cache, prefetch, available
 
 
 def _read_header(path):

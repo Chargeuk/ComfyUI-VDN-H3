@@ -114,7 +114,10 @@ builds, no `pip install`.
 > (strength 1.016) renders clean — it is specifically off-manifold rounding
 > noise, not the delta math. Merge is required for stage-dmd-*; bypass remains
 > available for non-DMD checkpoints.
-| `branch_weights` | **`auto`** (default; picks `cache_gpu` when free VRAM after the base load exceeds 1.5x the stage size + 4 GiB headroom, else `stream`; prefers the int8_convrot stage file under memory pressure) / `stream` (weights stream from disk straight to GPU per block per step, with a one-block lookahead prefetch — nothing extra held in RAM; safe on small cards) / `cache_gpu` (resident, faster, keep ~4.3 GB VRAM free) |
+| `branch_weights` | **`auto`** (rechecks residency at every model forward using free memory, workload size and offloaded base weights; selects the checkpoint representation at node application time) / `stream` (per-block transfers, with separately budgeted prefetch) / `cache_gpu` (explicit resident override; requires enough free VRAM) |
+| `prefetch` | **`auto`** / `off` / `on`: one-block lookahead, independent of `retain_buffers`. Both `auto` and `on` require estimated workspace and base-transfer headroom. Unused with resident branch weights. |
+| `compile_scan` | **Off by default.** Compile only the bidirectional recurrence scans; does not enable the existing fast epilogue, gather or activation kernels. First use compiles; graph memory and warm-up cost can outweigh the benefit on short runs. |
+| `fuse_statistics` | **Off by default.** Compile frame-statistics layout/cast/scaling preparation only; GEMMs, solver precision and the trained model are unchanged. Experimental; validate on the target GPU. |
 | `attention_backend` | `grouped` (default; one dense SDPA per window group) / `flex` (one compiled FlexAttention kernel; opt-in, see Benchmarks.md) |
 | `verbose` | log the applied adapters and per-forward layout |
 
@@ -273,14 +276,43 @@ picks `stream` automatically when VRAM is tight.
 
 **`retain_buffers` — speed vs VRAM, resolved automatically.** The node keeps
 some branch scratch alive between blocks (scan banks, delta-solve scratch,
-window gather buffers, q/k/v copies) and prefetches the next weight block in
-stream mode. Retained, steps run without per-block allocation churn — measured
+window gather buffers). Retained, steps run without per-block allocation churn — measured
 ~15% faster than v1.3.1 at 1280x736/145f in stream mode; the measured peak
 increment is small (~0.1 GiB at 736p, none detected at 145f). `auto` (the
-default) measures it for you: retain when free VRAM ≥ stage size + 10 GiB
-headroom, otherwise fall back to the transient v1.3.1 allocation pattern (and
-skip the prefetch stream) so small cards prioritize fitting over speed. `on`
+default) uses an apply-time heuristic: retain when free VRAM ≥ stage size + 10 GiB
+headroom, otherwise fall back to transient allocations. Prefetch is now budgeted
+independently, so transient scratch does not automatically disable it. `on`
 / `off` override.
+
+**Workload-aware placement.** At each diffusion forward, automatic caching reserves
+the greater of 4 GiB or an activation/state-bank estimate, plus nonresident base
+weights, then requires 1.5× the branch file size. Streaming prefetch reserves a
+bounded base-transfer working set instead of the whole offloaded base. These are
+conservative estimates, not an OOM guarantee. The policy uses ComfyUI's available
+memory report rather than GPU names, including its shared-memory handling on GB10.
+Manual `stream` / `cache_gpu` and `prefetch: off` remain available.
+
+The default path also drops unused RoPE views before linear readout and replaces
+the per-layer epsilon device readback with its exact dtype-rounded host constant.
+No attention windows, temporal convolutions, model files or precision defaults
+are changed. New controls are appended to preserve existing workflow widget order.
+`verbose` adds local option and prefetch hit/miss logs; placement changes and
+compile failures are always reported. No profiling synchronizations or telemetry
+are added to model execution.
+
+The new CUDA statistics and scan paths have exact-parity tests in
+`tests/test_performance_cuda.py`; memory/lifetime/API tests are in
+`tests/test_performance_policy.py`. A passing micro-test is not a full video-quality
+or throughput validation. Keep `fast_kernels` off for final DMD renders, and
+benchmark optional compilation separately on each GPU and workload.
+
+Reproduce kernel timings with `PYTHONPATH=../.. python tools/benchmark_performance.py`
+from this node's directory using the ComfyUI Python environment. On the tested
+4080 Super / torch 2.13.0+cu130, F=17, H=56, S=256, D=128: statistics preparation
+plus GEMMs took 2.714 ms eager / 2.498 ms fused; scans took 0.988 ms eager /
+2.070 ms compiled (warm medians, 20 repeats). Compiled scan allocated peak memory
+also increased, so it remains off by default. These measurements do not establish
+a speedup on a 5090 or DGX Spark, which were not tested.
 
 **VAE decode VRAM spike.** Stock `VAEDecode` untiled is the decode-time VRAM
 spike at 768p+ or on long clips — it decodes every frame in one shot. Use a
@@ -334,4 +366,3 @@ If you use VDN-H3, cite the authors:
   url    = {https://openvdn.github.io/}
 }
 ```
-

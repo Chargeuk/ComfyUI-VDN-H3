@@ -31,6 +31,7 @@ from comfy.patcher_extension import WrappersMP
 
 from vdn_h3.branch import LinearBranch
 from vdn_h3.window import full_coverage, window_bounds
+from vdn_h3.spec import runtime_memory_policy
 
 _log = logging.getLogger("comfy.vdn")
 _seen = set()
@@ -68,13 +69,14 @@ class _StreamPrefetcher:
     block in flight -- the extra residency is one block (~86 MB bf16 / 43 MB
     int8)."""
 
-    def __init__(self):
+    def __init__(self, device=None):
         self._queue = queue.Queue(maxsize=1)
         self._done = {}
-        self._inflight = set()
+        self._inflight = {}
         self._lock = threading.Lock()
         self._gen = 0
         self._stream = None
+        self._device = device
         self._thread = threading.Thread(target=self._worker, daemon=True,
                                         name="vdn-branch-prefetch")
         self._thread.start()
@@ -84,12 +86,14 @@ class _StreamPrefetcher:
             if index in self._done or index in self._inflight:
                 return
             gen = self._gen
-            self._inflight.add(index)
+            ready = threading.Event()
+            self._inflight[index] = ready
         try:
-            self._queue.put_nowait((gen, index, fetch))
+            self._queue.put_nowait((gen, index, fetch, ready))
         except queue.Full:
             with self._lock:
-                self._inflight.discard(index)
+                self._inflight.pop(index, None)
+                ready.set()
 
     def _record(self, t, stream):
         """Mark every storage of t (plain or kitchen QuantizedTensor) as used on
@@ -114,12 +118,12 @@ class _StreamPrefetcher:
 
     def _worker(self):
         while True:
-            gen, index, fetch = self._queue.get()
+            gen, index, fetch, ready = self._queue.get()
             try:
                 if gen != self._gen:
                     continue
                 if self._stream is None:
-                    self._stream = torch.cuda.Stream()
+                    self._stream = torch.cuda.Stream(device=self._device)
                 with torch.cuda.stream(self._stream):
                     w = fetch()
                     ev = torch.cuda.Event()
@@ -132,15 +136,24 @@ class _StreamPrefetcher:
                              "will read synchronously", e)
             finally:
                 with self._lock:
-                    self._inflight.discard(index)
+                    if self._inflight.get(index) is ready:
+                        self._inflight.pop(index, None)
+                    ready.set()
+                # The idle daemon must not retain the last block's GPU storage.
+                w = ev = fetch = None
 
     def take(self, index):
+        # A late prefetch must be consumed, not duplicated by a synchronous read.
+        with self._lock:
+            ready = self._inflight.get(index)
+        if ready is not None:
+            ready.wait()
         with self._lock:
             hit = self._done.pop(index, None)
         if hit is None:
             return None
         w, ev = hit
-        cur = torch.cuda.current_stream()
+        cur = torch.cuda.current_stream(device=self._device)
         cur.wait_event(ev)
         for t in w.values():
             self._record(t, cur)
@@ -152,6 +165,9 @@ class _StreamPrefetcher:
         with self._lock:
             self._gen += 1
             self._done.clear()
+            for ready in self._inflight.values():
+                ready.set()
+            self._inflight.clear()
         try:
             while True:
                 self._queue.get_nowait()
@@ -200,6 +216,45 @@ class VDNState:
         self._act_key = None
         self._prefetcher = None
         self.forwards = 0
+        self.cache_mode = "stream"
+        self.prefetch_mode = "auto"
+        self.prefetch_enabled = False
+        self.stage_bytes = 0
+        self.block_bytes = 0
+        self.base_stream_bytes = 0
+        self.unloaded_bytes = lambda: 0
+        self.verbose = False
+        self._placement = None
+        self.prefetch_hits = 0
+        self.prefetch_misses = 0
+
+    def configure_memory(self, device, dtype):
+        """Execution-boundary placement; no reads of GPU tensor values."""
+        lay = self.layout
+        element_size = dtype.itemsize
+        token_bytes = lay.seq_len * self.num_heads * self.head_dim * element_size
+        bank_bytes = lay.num_frames * self.num_heads * self.head_dim ** 2 * 4
+        # Conservative workspace estimate, not a measured allocation peak.
+        working = max(4 << 30, 12 * token_bytes + 8 * bank_bytes)
+        free = comfy.model_management.get_free_memory(device)
+        owned = self.stage_bytes * len(self._gpu_cache) / max(1, len(self.branches))
+        unloaded = self.unloaded_bytes()
+        cache, prefetch, budget = runtime_memory_policy(
+            free + owned, self.stage_bytes, self.block_bytes, working, unloaded,
+            self.cache_mode, self.prefetch_mode, self.base_stream_bytes)
+        prefetch = prefetch and torch.device(device).type == "cuda"
+        if not cache:
+            self._gpu_cache.clear()
+        if not prefetch and self._prefetcher is not None:
+            self._prefetcher.reset()
+        self.cache_gpu, self.prefetch_enabled = cache, prefetch
+        placement = (cache, prefetch, lay.seq_len, unloaded > 0)
+        if placement != self._placement:
+            _log.info("[vdn] placement: %s, prefetch %s; %.2f GiB cache budget "
+                      "after %.2f GiB workspace and %.2f GiB base reserve",
+                      "cache_gpu" if cache else "stream", "on" if prefetch else "off",
+                      budget / (1 << 30), working / (1 << 30), unloaded / (1 << 30))
+            self._placement = placement
 
     def act_scratch(self, video_rows, text_rows, device, dtype):
         """The raw pre-RoPE q/k/v copies the linear branch reads. Retained mode:
@@ -228,9 +283,9 @@ class VDNState:
             self._act_key = key
         return self._act
 
-    def _prefetch(self):
+    def _prefetch(self, device):
         if self._prefetcher is None:
-            self._prefetcher = _StreamPrefetcher()
+            self._prefetcher = _StreamPrefetcher(device)
         return self._prefetcher
 
     def weights_on(self, index, device, dtype):
@@ -251,22 +306,18 @@ class VDNState:
                 self._gpu_cache[key] = hit
             return hit
         if torch.device(device).type == "cuda":
-            if not self.retain_buffers:
-                # pressure mode: skip the prefetch side-stream too -- its pool
-                # costs residency + fragmentation and only pays off when there
-                # is headroom to spend
+            if not self.prefetch_enabled:
                 return {k: fetch(t) for k, t in w.items()}
-            # stream with a one-block lookahead: block i+1's page-cache->GPU copy
-            # runs on the prefetch thread while block i computes. The chain wraps
-            # around (last block prefetches block 0), so steps after the first
-            # start with block 0 already in flight; the fetched weights are the
-            # same disk tensors every forward, so a wrapped entry stays valid.
-            pf = self._prefetch()
+            # One-block lookahead, bounded to this forward's lifetime.
+            pf = self._prefetch(device)
             hit = pf.take(index)
             if hit is None:
+                self.prefetch_misses += 1
                 hit = {k: fetch(t) for k, t in w.items()}
-            nxt = (index + 1) % len(self.branches)
-            if self.branches[nxt] is not None:
+            else:
+                self.prefetch_hits += 1
+            nxt = index + 1
+            if nxt < len(self.branches) and self.branches[nxt] is not None:
                 wn = self.branches[nxt].w
                 pf.request(nxt, lambda: {k: fetch(t) for k, t in wn.items()})
             return hit
@@ -319,6 +370,8 @@ def make_layout_wrapper(state):
               f"frame {lay.frame_size}, text {lay.text_len} rows, "
               f"window {'dense (full cover)' if lay.full_cover else lay.bounds[0]}")
         try:
+            state.configure_memory(args[0][0].device, args[0][0].dtype)
+            state.prefetch_hits = state.prefetch_misses = 0
             return executor(*args, **kwargs)
         except comfy.model_management.InterruptProcessingException:
             # A cancelled mid-run leaves this node's GPU cache behind and the
@@ -336,6 +389,11 @@ def make_layout_wrapper(state):
             torch.cuda.empty_cache()
             raise
         finally:
+            if state._prefetcher is not None:
+                state._prefetcher.reset()
+            if state.verbose:
+                _log.info("[vdn] forward %d: prefetch hits=%d misses=%d",
+                          state.forwards, state.prefetch_hits, state.prefetch_misses)
             if owns_switch:
                 comfy.cli_args.args.disable_comfy_compiler = False
             state.layout = None
@@ -423,6 +481,7 @@ def make_vdn_forward(attn, state, block_index):
                 q4, k4, rope_freqs, qw, kw, epsilon=q_norm.eps, rot_dim=rot)
             q = q4[0]
             k = k4[0]
+            del q4, k4
         else:
             q = q_norm(q_raw)
             k = k_norm(k_raw)
