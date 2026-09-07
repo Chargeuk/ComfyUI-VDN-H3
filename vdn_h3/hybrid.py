@@ -432,6 +432,9 @@ def _base_attention(attn, x, rope_freqs, transformer_options):
     return attn.out_proj(out.squeeze(0))
 
 
+VDN_LOCAL_ATTENTION_API = 1
+
+
 def make_vdn_forward(attn, state, block_index):
     """The object-patched Attention.forward for one DiT block."""
     heads, head_dim = attn.heads, attn.head_dim
@@ -492,7 +495,10 @@ def make_vdn_forward(attn, state, block_index):
         # copy at the call site instead of one clone per block per step.
 
         if window_active:
-            if getattr(state, "softmax_backend", "grouped") == "flex":
+            select_local_attention = transformer_options.get("vdn_local_attention")
+            local_attention = (select_local_attention(block_index)
+                               if select_local_attention is not None else None)
+            if local_attention is None and getattr(state, "softmax_backend", "grouped") == "flex":
                 from vdn_h3.window import window_softmax_flex
                 try:
                     softmax_out = window_softmax_flex(
@@ -503,7 +509,7 @@ def make_vdn_forward(attn, state, block_index):
                     state.softmax_backend = "grouped"
                     _log.warning("[vdn] flex attention failed (%s); falling back "
                                  "to grouped SDPA", e)
-            if getattr(state, "softmax_backend", "grouped") != "flex":
+            if local_attention is not None or getattr(state, "softmax_backend", "grouped") != "flex":
                 from vdn_h3.window import window_softmax_grouped
                 # Windows always run exact SDPA: routing them through the model's
                 # optimized_attention_override (sage/kitchen int8) measurably
@@ -514,7 +520,8 @@ def make_vdn_forward(attn, state, block_index):
                     q, k, v, lay.video_start, lay.video_end, lay.num_frames,
                     lay.tokens_per_frame, lay.bounds, head_dim ** -0.5,
                     anchor_frames=cfg["anchor_frames"],
-                    retain_buffers=state.retain_buffers)
+                    retain_buffers=state.retain_buffers,
+                    local_attention=local_attention)
         else:
             q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
             k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))

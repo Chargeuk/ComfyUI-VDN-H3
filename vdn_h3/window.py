@@ -82,6 +82,7 @@ def _window_plan(video_start, video_end, num_frames, tokens_per_frame, bounds,
         grouped.setdefault((lo, hi), []).append(f)
 
     groups = []
+    group_protected_ranges = []
     max_rows = global_idx.numel()
     for (lo, hi), frames in grouped.items():
         extra = [f for f in anchors
@@ -90,8 +91,16 @@ def _window_plan(video_start, video_end, num_frames, tokens_per_frame, bounds,
         win_idx = torch.cat([frame_rows(f) for f in key_frames])
         q_idx = torch.cat([frame_rows(f) for f in frames])
         groups.append((q_idx, win_idx))
+        protected = [(0, global_idx.numel())] if global_idx.numel() else []
+        if anchor_frames in ("columns", "both"):
+            for i, f in enumerate(key_frames):
+                if f in anchors:
+                    start = global_idx.numel() + i * tokens_per_frame
+                    protected.append((start, start + tokens_per_frame))
+        group_protected_ranges.append(tuple(protected))
         max_rows = max(max_rows, global_idx.numel() + win_idx.numel())
     plan = dict(global_idx=global_idx, groups=groups,
+                group_protected_ranges=group_protected_ranges,
                 anchor_slices=[(video_start + f * tokens_per_frame,
                                 video_start + (f + 1) * tokens_per_frame)
                                for f in anchor_rows],
@@ -133,7 +142,7 @@ def clear_window_state():
 def window_softmax_grouped(query, key, value, video_start, video_end,
                            num_frames, tokens_per_frame, bounds, scale,
                            anchor_frames="none", transformer_options=None,
-                           retain_buffers=True):
+                           retain_buffers=True, local_attention=None):
     """Windowed softmax over the packed sequence [globals | video], one dense SDPA
     call per distinct query group.
 
@@ -143,6 +152,9 @@ def window_softmax_grouped(query, key, value, video_start, video_end,
     widened by the anchor frames per `anchor_frames` (official semantics: "columns"
     makes frames 0 and F-1 visible to every query, "rows" makes those two frames'
     queries see everything, "both" is exact on both sides).
+    ``local_attention``, when supplied by an opt-in model patch, handles only
+    ordinary video query groups. Global and anchor queries remain exact. It
+    receives protected half-open key ranges in the gathered window's coordinates.
     """
     heads, head_dim = query.shape[1], query.shape[2]
     seq = query.shape[0]
@@ -166,13 +178,18 @@ def window_softmax_grouped(query, key, value, video_start, video_end,
         if g:
             k_scratch[:g].copy_(global_k)
             v_scratch[:g].copy_(global_v)
-        for q_idx, win_idx in groups:
+        for group_index, (q_idx, win_idx) in enumerate(groups):
             w = win_idx.numel()
             torch.index_select(key, 0, win_idx, out=k_scratch[g:g + w])
             torch.index_select(value, 0, win_idx, out=v_scratch[g:g + w])
             q_rows = query.index_select(0, q_idx)
-            out[q_idx] = _sdpa(q_rows, k_scratch[:g + w], v_scratch[:g + w],
-                               scale, transformer_options)
+            if local_attention is None:
+                out[q_idx] = _sdpa(q_rows, k_scratch[:g + w], v_scratch[:g + w],
+                                   scale, transformer_options)
+            else:
+                out[q_idx] = local_attention(
+                    q_rows, k_scratch[:g + w], v_scratch[:g + w], scale,
+                    plan["group_protected_ranges"][group_index])
 
     for a, b in plan["anchor_slices"]:
         out[a:b] = _sdpa(query[a:b], key, value, scale, transformer_options)
