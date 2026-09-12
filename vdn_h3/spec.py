@@ -321,7 +321,9 @@ def load_vdn_checkpoint(path, prefer_int8=False):
     if os.path.isdir(adapters_root):
         for name in sorted(os.listdir(adapters_root)):
             adir = os.path.join(adapters_root, name)
-            cfg_file = os.path.join(adir, "adapter_config.json")
+            cfg_file = os.path.join(adir, "adapter_spec.json")
+            if not os.path.isfile(cfg_file):
+                cfg_file = os.path.join(adir, "adapter_config.json")
             weights_file = os.path.join(adir, "adapter_model.safetensors")
             if os.path.isfile(cfg_file) and os.path.isfile(weights_file):
                 # Loader, not the loaded dict: the (fp32-on-disk) adapter tensors

@@ -106,6 +106,14 @@ the upstream mathematical comparison are in
   plain and INT8 tensors; the full suite passes 51 tests.
 
 
+## v1.5.2
+
+- Fixes the false missing Stage-B adapter error with current OpenVDN downloads
+  in both Apply VDN-H3 nodes (#12).
+- Loads `adapter_spec.json`, with `adapter_config.json` as a fallback for older
+  checkpoints. Restart ComfyUI after updating; no checkpoint renaming is needed.
+
+
 ## Install
 
 1. Clone into `ComfyUI/custom_nodes/` and restart ComfyUI:

@@ -1,4 +1,5 @@
 """Checkpoint mapping, short-clip gating, and inference buffer lifetime."""
+import json
 import weakref
 import queue
 import threading
@@ -11,6 +12,38 @@ from safetensors.torch import save_file
 
 from comfy.ldm.modules.attention import attention_pytorch
 from vdn_h3 import adapters, branch, hybrid, nodes, spec
+
+
+@pytest.mark.parametrize("metadata_files", [
+    ("adapter_spec.json",),
+    ("adapter_config.json",),
+    ("adapter_spec.json", "adapter_config.json"),
+])
+def test_checkpoint_adapter_metadata(tmp_path, monkeypatch, metadata_files):
+    monkeypatch.setattr(spec, "_CACHE", {})
+    monkeypatch.setattr(spec, "transform_config", lambda value: value)
+    monkeypatch.setattr(spec, "_lazy_branch_sd", lambda path: {})
+    branch_dir = tmp_path / "linear_branch"
+    branch_dir.mkdir()
+    (branch_dir / "model.safetensors").touch()
+    (tmp_path / "model_spec.json").write_text("{}", encoding="utf-8")
+    expected = {"config": {"rank": 2, "alpha": 6}}
+    weights = {"projection.lora_A.weight": torch.ones(2, 3)}
+    for name in ("default", "turbo"):
+        adir = tmp_path / "adapters" / name
+        adir.mkdir(parents=True)
+        for index, filename in enumerate(metadata_files):
+            metadata = expected if index == 0 else {"config": {"alpha": 99}}
+            (adir / filename).write_text(json.dumps(metadata), encoding="utf-8")
+        save_file(weights, str(adir / "adapter_model.safetensors"))
+
+    _, _, loaded = spec.load_vdn_checkpoint(str(tmp_path))
+    assert set(loaded) == {"default", "turbo"}
+    for loader, metadata in loaded.values():
+        assert metadata == expected
+        assert adapters.per_module_scale(metadata, "projection") == 3
+        torch.testing.assert_close(loader()["projection.lora_A.weight"],
+                                   weights["projection.lora_A.weight"])
 
 
 @pytest.mark.parametrize("name", ["default", "turbo"])
