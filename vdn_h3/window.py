@@ -137,6 +137,7 @@ def clear_window_state():
     """Drop cached window plans and the k/v scratch (run interrupt / cleanup)."""
     _PLAN_CACHE.clear()
     _KV_SCRATCH.clear()
+    _BM_CACHE.clear()
 
 
 def window_softmax_grouped(query, key, value, video_start, video_end,
@@ -318,7 +319,7 @@ def _sdpa(q_rows, k_rows, v_rows, scale, transformer_options=None):
 # ---------------------------------------------------------------- flex path --
 
 _FLEX = None
-_BM_CACHE = {}
+_BM_CACHE = collections.OrderedDict()
 
 
 def _build_window_tables(seq, video_start, video_end, num_frames,
@@ -370,7 +371,7 @@ def window_softmax_flex(query, key, value, video_start, video_end, num_frames,
         _FLEX = torch.compile(flex_attention)
     seq = query.shape[0]
     ck = (seq, video_start, video_end, num_frames, tokens_per_frame,
-          anchor_frames, tuple(tuple(b) for b in bounds), query.device.type)
+          anchor_frames, tuple(tuple(b) for b in bounds), str(query.device))
     bm = _BM_CACHE.get(ck)
     if bm is None:
         lo, hi = _build_window_tables(seq, video_start, video_end, num_frames,
@@ -380,6 +381,10 @@ def window_softmax_flex(query, key, value, video_start, video_end, num_frames,
                              tokens_per_frame, lo, hi, anchor_frames),
             None, None, seq, seq, query.device, _compile=True)
         _BM_CACHE[ck] = bm
+        while len(_BM_CACHE) > MAX_CACHED_PLANS:
+            _BM_CACHE.popitem(last=False)
+    else:
+        _BM_CACHE.move_to_end(ck)
     out = _FLEX(query.transpose(0, 1).unsqueeze(0),
                 key.transpose(0, 1).unsqueeze(0),
                 value.transpose(0, 1).unsqueeze(0),
